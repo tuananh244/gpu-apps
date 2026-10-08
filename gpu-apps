@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""gpu-apps: chọn app nào luôn khởi động trên card NVIDIA (PRIME render offload).
+
+Mỗi app được bật sẽ có một file .desktop ghi đè trong ~/.local/share/applications,
+với dòng Exec được bọc thêm các biến môi trường offload. Tắt đi thì file ghi đè bị xoá.
+"""
+import argparse
+import curses
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+OFFLOAD_ENV = (
+    "__NV_PRIME_RENDER_OFFLOAD=1",
+    "__VK_LAYER_NV_optimus=NVIDIA_only",
+    "__GLX_VENDOR_LIBRARY_NAME=nvidia",
+)
+# Chromium/Electron trên Wayland bỏ qua offload; phải chạy qua XWayland.
+X11_FLAG = "--ozone-platform=x11"
+MARKER = "X-GpuApps-Managed"
+X11_KEY = "X-GpuApps-X11"
+
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+USER_APPS = DATA_HOME / "applications"
+BACKUPS = STATE_HOME / "gpu-apps" / "backups"
+
+_TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\S+')
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_CHROMIUM_NAME = re.compile(r"chrom|electron|brave|vivaldi|msedge|microsoft-edge|opera", re.I)
+_CHROMIUM_SCRIPT = re.compile(rb"electron|chromium|chrome", re.I)
+
+
+@dataclass
+class App:
+    id: str
+    name: str
+    enabled: bool
+    source: Path | None  # file gốc dùng để sinh file ghi đè
+    entry: dict
+
+    @property
+    def target(self):
+        return USER_APPS / self.id
+
+    @property
+    def backup(self):
+        return BACKUPS / self.id
+
+    @property
+    def short_id(self):
+        return self.id.removesuffix(".desktop")
+
+    @property
+    def visible(self):
+        e = self.entry
+        return (
+            e.get("Type") == "Application"
+            and "Exec" in e
+            and e.get("NoDisplay", "").lower() != "true"
+            and e.get("Hidden", "").lower() != "true"
+        )
+
+
+def read_entry(path):
+    entry, group = {}, None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return entry
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            group = line
+        elif group == "[Desktop Entry]" and "=" in line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            entry.setdefault(key.strip(), value.strip())
+    return entry
+
+
+def app_dirs():
+    dirs = [USER_APPS]
+    for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+        if d:
+            dirs.append(Path(d) / "applications")
+    return dirs
+
+
+def discover():
+    """Trả về mọi app theo thứ tự ưu tiên XDG, kể cả app đang ẩn."""
+    apps = {}
+    for d in app_dirs():
+        if not d.is_dir():
+            continue
+        for f in sorted(d.rglob("*.desktop")):
+            app_id = str(f.relative_to(d)).replace("/", "-")
+            known = apps.get(app_id)
+            if known:
+                if known.enabled and known.source is None:
+                    known.source = f
+                continue
+            entry = read_entry(f)
+            managed = d == USER_APPS and entry.get(MARKER) == "true"
+            app = App(app_id, entry.get("Name", app_id), managed, None if managed else f, entry)
+            if managed and app.backup.exists():
+                app.source = app.backup
+            apps[app_id] = app
+    return apps
+
+
+def split_exec(cmd):
+    """Trả về (vị trí kết thúc của tên chương trình, tên chương trình), bỏ qua tiền tố `env A=b`."""
+    tokens = [(m.end(), m.group()) for m in _TOKEN.finditer(cmd)]
+    if not tokens:
+        return 0, ""
+    i = 0
+    if os.path.basename(tokens[0][1].strip('"')) == "env":
+        i = 1
+        while i < len(tokens) and _ASSIGNMENT.match(tokens[i][1]):
+            i += 1
+        if i >= len(tokens):
+            i = 0
+    return tokens[i][0], tokens[i][1].strip('"')
+
+
+def wrap_exec(cmd, x11):
+    end, _ = split_exec(cmd)
+    flag = f" {X11_FLAG}" if x11 and "--ozone-platform" not in cmd else ""
+    return f"env {' '.join(OFFLOAD_ENV)} {cmd[:end]}{flag}{cmd[end:]}"
+
+
+def is_chromium_based(program):
+    if _CHROMIUM_NAME.search(os.path.basename(program)):
+        return True
+    path = shutil.which(program)
+    if not path:
+        return False
+    real = Path(path).resolve()
+    if (real.parent / "chrome_100_percent.pak").exists():
+        return True
+    try:
+        with real.open("rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    return head.startswith(b"#!") and _CHROMIUM_SCRIPT.search(head) is not None
+
+
+def rewrite(text, x11):
+    out = []
+    for line in text.splitlines():
+        if line.startswith("X-GpuApps-"):
+            continue
+        if line.startswith("Exec="):
+            line = "Exec=" + wrap_exec(line[5:], x11)
+        elif line.startswith("DBusActivatable="):
+            # Nếu để D-Bus kích hoạt thì dòng Exec (và biến môi trường) bị bỏ qua.
+            line = "DBusActivatable=false"
+        out.append(line)
+        if line.strip() == "[Desktop Entry]":
+            out.append(f"{MARKER}=true")
+            out.append(f"{X11_KEY}={'true' if x11 else 'false'}")
+    return "\n".join(out) + "\n"
+
+
+def flatpak_missing_nvidia(program):
+    if os.path.basename(program) != "flatpak":
+        return False
+    try:
+        runtimes = subprocess.run(
+            ["flatpak", "list", "--runtime", "--columns=application"],
+            capture_output=True, text=True, check=False,
+        ).stdout
+    except OSError:
+        return True
+    return "org.freedesktop.Platform.GL.nvidia" not in runtimes
+
+
+def enable(app, x11=None):
+    """Bật offload cho app. Trả về chuỗi lỗi, hoặc None nếu thành công."""
+    if app.source is None:
+        return "không tìm thấy file .desktop gốc (app đã bị gỡ?)"
+    text = app.source.read_text(encoding="utf-8", errors="replace")
+    _, program = split_exec(read_entry(app.source).get("Exec", ""))
+    if flatpak_missing_nvidia(program):
+        return ("app Flatpak, nhưng chưa có runtime org.freedesktop.Platform.GL.nvidia-* "
+                "khớp với driver (thử `flatpak update`)")
+    if x11 is None:
+        x11 = is_chromium_based(program)
+    if app.source.parent != BACKUPS and USER_APPS in app.source.parents:
+        # File do người dùng tự tạo: cất đi để khôi phục khi tắt.
+        BACKUPS.mkdir(parents=True, exist_ok=True)
+        shutil.move(app.source, app.backup)
+        app.source = app.backup
+    USER_APPS.mkdir(parents=True, exist_ok=True)
+    tmp = app.target.with_suffix(".tmp")
+    tmp.write_text(rewrite(text, x11), encoding="utf-8")
+    tmp.replace(app.target)
+    app.enabled = True
+    return None
+
+
+def disable(app):
+    if not app.enabled:
+        return
+    app.target.unlink(missing_ok=True)
+    if app.backup.exists():
+        shutil.move(app.backup, app.target)
+    app.enabled = False
+
+
+def update_database():
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", "-q", str(USER_APPS)], check=False)
+
+
+def find(apps, query):
+    q = query.lower().removesuffix(".desktop")
+    exact = [a for a in apps if a.short_id.lower() == q or a.name.lower() == q]
+    matches = exact or [a for a in apps if q in a.short_id.lower() or q in a.name.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        sys.exit(f"Không tìm thấy app nào khớp với '{query}'. Xem `gpu-apps list`.")
+    names = ", ".join(a.short_id for a in matches)
+    sys.exit(f"'{query}' khớp với nhiều app: {names}")
+
+
+def visible_apps():
+    apps = [a for a in discover().values() if a.visible or a.enabled]
+    return sorted(apps, key=lambda a: a.name.lower())
+
+
+def cmd_list(_args):
+    for a in visible_apps():
+        print(f"[{'x' if a.enabled else ' '}] {a.name}  ({a.short_id})")
+
+
+def apply_changes(to_enable, to_disable, x11=None):
+    for a in to_disable:
+        disable(a)
+        print(f"Đã tắt: {a.name}")
+    failed = False
+    for a in to_enable:
+        error = enable(a, x11)
+        if error:
+            failed = True
+            print(f"Bỏ qua {a.name}: {error}", file=sys.stderr)
+        else:
+            print(f"Đã bật: {a.name}")
+    if to_enable or to_disable:
+        update_database()
+        print("Đóng hẳn app rồi mở lại để thay đổi có hiệu lực.")
+    return 1 if failed else 0
+
+
+def cmd_enable(args):
+    apps = visible_apps()
+    return apply_changes([find(apps, q) for q in args.apps], [], args.x11)
+
+
+def cmd_disable(args):
+    apps = visible_apps()
+    return apply_changes([], [find(apps, q) for q in args.apps])
+
+
+def cmd_refresh(_args):
+    """Sinh lại file ghi đè, dùng sau khi app được cập nhật."""
+    enabled = [a for a in visible_apps() if a.enabled]
+    failed = False
+    for a in enabled:
+        error = enable(a, a.entry.get(X11_KEY) == "true")
+        if error:
+            failed = True
+            print(f"Bỏ qua {a.name}: {error}", file=sys.stderr)
+        else:
+            print(f"Đã làm mới: {a.name}")
+    update_database()
+    return 1 if failed else 0
+
+
+def cmd_status(_args):
+    """Liệt kê tiến trình của bạn đang mở thiết bị NVIDIA."""
+    found = False
+    for proc in sorted(Path("/proc").glob("[0-9]*"), key=lambda p: int(p.name)):
+        try:
+            fds = [os.readlink(fd) for fd in (proc / "fd").iterdir()]
+            if not any(fd.startswith("/dev/nvidia") for fd in fds):
+                continue
+            cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        found = True
+        print(f"{proc.name:>8}  {cmdline.strip()[:100]}")
+    if not found:
+        print("Không có tiến trình nào của bạn đang dùng card NVIDIA.")
+
+
+def pick(stdscr, apps):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    checked = [a.enabled for a in apps]
+    pos = top = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        rows = max(1, height - 2)
+        top = min(top, pos)
+        if pos >= top + rows:
+            top = pos - rows + 1
+        stdscr.addnstr(0, 0, "Chọn app chạy bằng GPU NVIDIA  |  ↑↓ di chuyển · Space chọn · Enter lưu · q huỷ",
+                       width - 1, curses.A_BOLD)
+        for i in range(top, min(len(apps), top + rows)):
+            line = f"[{'x' if checked[i] else ' '}] {apps[i].name}  ({apps[i].short_id})"
+            stdscr.addnstr(2 + i - top, 0, line, width - 1, curses.A_REVERSE if i == pos else 0)
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            pos = max(0, pos - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            pos = min(len(apps) - 1, pos + 1)
+        elif key == curses.KEY_PPAGE:
+            pos = max(0, pos - rows)
+        elif key == curses.KEY_NPAGE:
+            pos = min(len(apps) - 1, pos + rows)
+        elif key == ord(" "):
+            checked[pos] = not checked[pos]
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return checked
+        elif key in (ord("q"), 27):
+            return None
+
+
+def cmd_interactive(_args):
+    apps = visible_apps()
+    if not apps:
+        sys.exit("Không tìm thấy app nào.")
+    checked = curses.wrapper(pick, apps)
+    if checked is None:
+        print("Đã huỷ, không thay đổi gì.")
+        return 0
+    to_enable = [a for a, c in zip(apps, checked) if c and not a.enabled]
+    to_disable = [a for a, c in zip(apps, checked) if not c and a.enabled]
+    if not to_enable and not to_disable:
+        print("Không có thay đổi.")
+        return 0
+    return apply_changes(to_enable, to_disable)
+
+
+def main():
+    locale.setlocale(locale.LC_ALL, "")
+    parser = argparse.ArgumentParser(
+        prog="gpu-apps",
+        description="Chọn app nào luôn khởi động trên card NVIDIA. Không có lệnh con thì mở danh sách để tick chọn.",
+    )
+    parser.set_defaults(func=cmd_interactive)
+    sub = parser.add_subparsers(metavar="lệnh")
+    sub.add_parser("list", help="liệt kê app và trạng thái").set_defaults(func=cmd_list)
+    p = sub.add_parser("enable", help="bật GPU NVIDIA cho app")
+    p.add_argument("apps", nargs="+", metavar="app")
+    p.add_argument("--x11", action=argparse.BooleanOptionalAction, default=None,
+                   help=f"ép thêm/bỏ cờ {X11_FLAG} (mặc định: tự nhận diện app Chromium/Electron)")
+    p.set_defaults(func=cmd_enable)
+    p = sub.add_parser("disable", help="trả app về GPU mặc định")
+    p.add_argument("apps", nargs="+", metavar="app")
+    p.set_defaults(func=cmd_disable)
+    sub.add_parser("refresh", help="sinh lại file ghi đè sau khi app được cập nhật").set_defaults(func=cmd_refresh)
+    sub.add_parser("status", help="xem tiến trình nào đang dùng card NVIDIA").set_defaults(func=cmd_status)
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
